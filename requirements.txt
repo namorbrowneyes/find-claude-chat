@@ -1,0 +1,11 @@
+# Dependencies for find-claude-chat-mac.py (macOS desktop-cache search).
+# Install with:  pip3 install -r requirements.txt
+#
+# Python 3.8+ is assumed (uses dict-union `|`).
+
+zstandard>=0.20   # REQUIRED — decompress claude.ai's zstd-encoded cache bodies.
+                  # If absent, the script falls back to the `zstd` CLI on PATH
+                  # (brew install zstd).
+
+brotli            # OPTIONAL — only needed if Claude ever serves brotli-encoded
+                  # bodies instead of zstd. gzip/deflate are handled by the stdlib.

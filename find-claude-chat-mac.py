@@ -24,8 +24,9 @@ Usage:
     python3 find-claude-chat-mac.py "kvm" --open          # open the top match in your browser
     python3 find-claude-chat-mac.py "kvm" --json          # machine-readable output
 
-Dependencies: zstandard (`pip3 install zstandard`). Auto-falls back to the `zstd` CLI if the
-module is missing. brotli/gzip/deflate bodies are also handled if Claude ever changes encoding.
+Dependencies: see requirements.txt (`pip3 install -r requirements.txt`). zstandard is required;
+auto-falls back to the `zstd` CLI if the module is missing. brotli/gzip/deflate bodies are also
+handled if Claude ever changes encoding.
 """
 import sys, os, re, struct, glob, argparse, subprocess, json, gzip, zlib, io
 

@@ -40,6 +40,7 @@ Each `-Code` result shows the project, date range, match count, a snippet, and a
 ### macOS — desktop app cache (`find-claude-chat-mac.py`)
 
 ```bash
+pip3 install -r requirements.txt                       # one-time setup (see requirements.txt)
 python3 find-claude-chat-mac.py "kvm"                  # find by topic
 python3 find-claude-chat-mac.py "macbook windows switch"  # multi-word = AND across the convo
 python3 find-claude-chat-mac.py --list                 # all cached conversations, newest first
@@ -56,7 +57,7 @@ date, and a snippet. Dependency: `zstandard` (`pip3 install zstandard`); falls b
 **macOS (`find-claude-chat-mac.py`):**
 
 - macOS with the Claude desktop app installed
-- Python 3 + `zstandard` (or the `zstd` CLI on PATH)
+- Python 3.8+ and the packages in [`requirements.txt`](requirements.txt) (`pip3 install -r requirements.txt`) — `zstandard` is required (or the `zstd` CLI on PATH; `brew install zstd`); `brotli` is optional
 - Read-only; no network calls
 
 **Windows (`Find-ClaudeChat.ps1`):**
