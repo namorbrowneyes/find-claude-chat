@@ -42,6 +42,17 @@
     indexes them), then opens https://claude.ai/cowork in your default browser
     where you can search/scroll the session list yourself.
 
+.PARAMETER Codex
+    Search OpenAI Codex transcripts on disk (~/.codex/sessions/**/rollout-*.jsonl
+    and archived_sessions). Multi-word -Name = AND (whole words) across real
+    user/assistant turns; titles from ~/.codex/session_index.jsonl; prints a
+    `codex resume <id>` line. -List shows recent threads. No app needed.
+
+.PARAMETER ChatGPT
+    Search ChatGPT chats (which keep NO local copy on Windows) plus Codex threads
+    by driving the ChatGPT desktop app's Ctrl+K command menu (server-side, with
+    snippets). Launches the app if it is not running. -Open opens the top hit.
+
 .PARAMETER Scheduled
     List scheduled tasks; with -Task "<name>" open that task's page and list its
     runs (each run is a Cowork session, URL printed). -Name matches the run's
@@ -92,6 +103,9 @@
     .\Find-ClaudeChat.ps1 -Cowork -Name "chatgpt subscription"
     .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief"                       # list runs + cse_ URLs
     .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Find "chatgpt pro subscription" -Open
+    .\Find-ClaudeChat.ps1 -Codex -Name "claude watchdog"          # Codex transcripts on disk
+    .\Find-ClaudeChat.ps1 -Codex -List
+    .\Find-ClaudeChat.ps1 -ChatGPT -Name "hermes" -Open           # ChatGPT chats + Codex threads via the app
 
 .NOTES
     Desktop-app modes require the Claude desktop app running and use Windows UI
@@ -108,6 +122,8 @@ param(
     [switch]$Code,
     [switch]$Cloud,
     [switch]$Cowork,
+    [switch]$Codex,
+    [switch]$ChatGPT,
     [switch]$Scheduled,
     [string]$Task,
     [string]$Find,
@@ -489,7 +505,236 @@ function Show-CodeSession($info, [int]$idx) {
     Write-Host "     resume:  cd `"$dir`"; claude --resume $($info.Id)" -ForegroundColor Cyan
 }
 
+# ── OpenAI Codex (desktop app + CLI) transcripts ───────────────────────────────
+# ~/.codex/session_index.jsonl = {id, thread_name, updated_at} per thread.
+# ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl (+ archived_sessions/) =
+# one JSON line per event; user/assistant text lives in
+# payload.type=='message' → payload.role + payload.content[].text.
+
+function Get-CodexSessionInfo([string]$path, [string[]]$terms, [hashtable]$titles) {
+    $id = $null; $cwd = $null; $firstTs = $null; $lastTs = $null; $firstPrompt = $null
+    $found = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+    $msgHits = New-Object System.Collections.Generic.List[object]
+    try { $reader = [System.IO.File]::OpenText($path) } catch { return $null }
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line.Length -lt 2) { continue }
+            $o = $null; try { $o = $line | ConvertFrom-Json } catch { continue }
+            if ($o.timestamp) {
+                $dt = $null
+                try { $dt = [datetime]::Parse([string]$o.timestamp, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal) } catch { }
+                if ($dt) { if (-not $firstTs) { $firstTs = $dt }; $lastTs = $dt }
+            }
+            $p = $o.payload
+            if (-not $p) { continue }
+            if ($o.type -eq 'session_meta') { if (-not $id) { $id = [string]$p.id }; if (-not $cwd -and $p.cwd) { $cwd = [string]$p.cwd }; continue }
+            if ($p.type -ne 'message' -or $p.role -notin 'user', 'assistant') { continue }
+            $who = $(if ($p.role -eq 'user') { 'you' } else { 'codex' })
+            foreach ($b in @($p.content)) {
+                $t = [string]$b.text
+                if (-not $t) { continue }
+                if ($who -eq 'you') {
+                    # skip injected app context / plugin catalogs / environment blocks
+                    if ($t.StartsWith('<') -or $t -match '^<(app-context|recommended_plugins|environment_context|user_instructions)') { continue }
+                    if ($t.Length -gt 6000) { continue }
+                    if (-not $firstPrompt) { $firstPrompt = $t }
+                }
+                if ($terms -and $terms.Count) {
+                    $hits = 0
+                    foreach ($term in $terms) { if ($t -match ('(?i)\b' + [regex]::Escape($term) + '\b')) { [void]$found.Add($term); $hits++ } }
+                    if ($hits -gt 0 -and $msgHits.Count -lt 200) { $msgHits.Add([PSCustomObject]@{ Who = $who; Text = $t; Hits = $hits }) }
+                }
+            }
+        }
+    } finally { $reader.Close() }
+    if (-not $id -and ([System.IO.Path]::GetFileNameWithoutExtension($path) -match '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$')) { $id = $Matches[1] }
+    $snips = @()
+    foreach ($m in ($msgHits | Sort-Object Hits -Descending | Select-Object -First 3)) {
+        $firstTerm = $null
+        foreach ($term in ($terms | Sort-Object { $_.Length } -Descending)) { if ($m.Text -match ('(?i)\b' + [regex]::Escape($term) + '\b')) { $firstTerm = $term; break } }
+        $snips += (Get-ChatSnippet $m.Text $firstTerm $m.Who)
+    }
+    $title = $(if ($id -and $titles.ContainsKey($id)) { $titles[$id] } else { $null })
+    return [PSCustomObject]@{
+        Id = $id; Path = $path; Cwd = $cwd; Title = $title
+        Project = $(if ($cwd) { Split-Path $cwd -Leaf } else { '(codex)' })
+        FirstTs = $firstTs; LastTs = $lastTs; FirstPrompt = $firstPrompt
+        TermsFound = $found.Count; TermsTotal = @($terms).Count
+        AllPresent = ($terms -and $terms.Count -and $found.Count -eq @($terms).Count)
+        MsgMatches = $msgHits.Count; Snippets = $snips
+    }
+}
+
+# ── ChatGPT desktop app (UIA) ─────────────────────────────────────────────────
+# The Windows ChatGPT app keeps NO conversation bodies on disk (cache checked
+# 2026-09-23: 0 conversation entries), but its Ctrl+K "Command menu" is a
+# server-side search over every ChatGPT chat AND every Codex thread, with
+# snippets. We drive that. Items: "<title> ChatGPT Ctrl+N" = ChatGPT chat,
+# "<title> <cwd-slug|project> Ctrl+N ... <snippet>" = Codex thread.
+
+$ChatGptAppId = 'OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!App'
+
+function Get-ChatGptWindow([switch]$Launch) {
+    for ($try = 0; $try -lt 2; $try++) {
+        $cgPids = @(Get-Process | Where-Object { $_.ProcessName -match '^ChatGPT' } | Select-Object -ExpandProperty Id)
+        if ($cgPids.Count) {
+            $w = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+                [System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition
+            ) | Where-Object { $_.Current.ProcessId -in $cgPids -and $_.Current.Name -eq 'ChatGPT' } | Select-Object -First 1
+            if ($w) { return $w }
+        }
+        if (-not $Launch -or $try -eq 1) { return $null }
+        Write-Host "ChatGPT app not running - launching it..." -ForegroundColor DarkGray
+        Start-Process "shell:AppsFolder\$ChatGptAppId"
+        Start-Sleep -Seconds 8
+    }
+    return $null
+}
+
+function Get-ChatGptCommandItems($window) {
+    $items = $window.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::ListItem
+        )
+    ) | Where-Object { $_.Current.AutomationId -like 'radix-*' -and $_.Current.Name }
+    return @($items)
+}
+
+function Search-ChatGptApp($window, [string]$query) {
+    # wait for the renderer to expose its tree (fresh launch takes a few seconds)
+    $searchBtn = $null
+    for ($n = 0; $n -lt 40 -and -not $searchBtn; $n++) {
+        $searchBtn = $window.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Button
+            )
+        ) | Where-Object { $_.Current.Name -eq 'Search' } | Select-Object -First 1
+        if (-not $searchBtn) { Start-Sleep -Milliseconds 500 }
+    }
+    if (-not $searchBtn) { throw "ChatGPT app has no 'Search' button in its UIA tree (still loading, or signed out?)." }
+    Invoke-UiaElement $searchBtn
+    $combo = $null
+    for ($n = 0; $n -lt 20 -and -not $combo; $n++) {
+        Start-Sleep -Milliseconds 150
+        $combo = $window.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::ComboBox
+            )
+        ) | Where-Object { $_.Current.Name -eq 'Command menu' } | Select-Object -First 1
+    }
+    if (-not $combo) { throw "ChatGPT command menu did not open." }
+    # baseline = static entries (settings, New chat, ...) shown with an empty query; exclude them later
+    $baseline = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($b in (Get-ChatGptCommandItems $window)) { [void]$baseline.Add([string]$b.Current.Name) }
+    $combo.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($query)
+    Start-Sleep -Milliseconds 3500
+    $out = @()
+    foreach ($it in (Get-ChatGptCommandItems $window)) {
+        $label = [string]$it.Current.Name
+        if ($baseline.Contains($label)) { continue }
+        $kind = 'codex'
+        $title = $label
+        $snippet = $null
+        if ($label -match '^(.*?) ChatGPT Ctrl\+\d+(?: \.\.\. (.*))?$') { $kind = 'chatgpt'; $title = $Matches[1]; $snippet = $Matches[2] }
+        elseif ($label -match '^(.*?) Ctrl\+\d+(?: \.\.\. (.*))?$') { $title = $Matches[1]; $snippet = $Matches[2] }
+        elseif ($label -match '^(.*?) \.\.\. (.*)$') { $title = $Matches[1]; $snippet = $Matches[2] }
+        $out += [PSCustomObject]@{ Kind = $kind; Title = $title; Snippet = $snippet; Label = $label; Element = $it }
+    }
+    return $out
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+if ($ChatGPT) {
+    if (-not $Name) { Write-Error "Provide -Name to search."; exit 1 }
+    $cg = Get-ChatGptWindow -Launch
+    if (-not $cg) { Write-Error "ChatGPT desktop app not running and could not be launched ($ChatGptAppId)."; exit 1 }
+    Write-Host "Searching ChatGPT app (chats + Codex threads, server-side) for: $Name" -ForegroundColor Cyan
+    $hits = @()
+    try { $hits = @(Search-ChatGptApp $cg $Name) } catch { Write-Error $_; exit 1 }
+    if (-not $hits.Count) {
+        Write-Warning "No ChatGPT/Codex results for '$Name'."
+    } else {
+        $i = 0
+        foreach ($h in ($hits | Select-Object -First $Limit)) {
+            $i++
+            Write-Host ("[{0}] {1,-7} {2}" -f $i, $h.Kind, $h.Title) -ForegroundColor Green
+            if ($h.Snippet) { Write-Host "     ...$($h.Snippet)" -ForegroundColor Gray }
+        }
+        Write-Host "(ChatGPT chats have no local copy - open them in the app with -Open; Codex threads are also greppable via -Codex)" -ForegroundColor DarkGray
+    }
+    if ($Open -and $hits.Count) {
+        Write-Host "Opening: $($hits[0].Title)" -ForegroundColor Green
+        $p = Get-Process | Where-Object { $_.ProcessName -match '^ChatGPT' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+        if ($p) { [WinFocusClaude]::ShowWindow($p.MainWindowHandle, 9) | Out-Null; [WinFocusClaude]::SetForegroundWindow($p.MainWindowHandle) | Out-Null }
+        Invoke-UiaElement $hits[0].Element
+    } else {
+        Add-Type -AssemblyName System.Windows.Forms
+        try { $combo = $cg.FindFirst([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Command menu')); if ($combo) { $combo.SetFocus(); [System.Windows.Forms.SendKeys]::SendWait('{ESC}') } } catch { }
+    }
+    exit $(if ($hits.Count) { 0 } else { 1 })
+}
+
+if ($Codex) {
+    $base = Join-Path $env:USERPROFILE '.codex'
+    if (-not (Test-Path $base)) { Write-Error "No Codex directory at $base"; exit 1 }
+    $files = @(Get-ChildItem -Path (Join-Path $base 'sessions'), (Join-Path $base 'archived_sessions') -Recurse -File -Filter 'rollout-*.jsonl' -ErrorAction SilentlyContinue)
+    if (-not $files.Count) { Write-Error "No Codex rollout transcripts under $base"; exit 1 }
+    $titles = @{}
+    $idx = Join-Path $base 'session_index.jsonl'
+    if (Test-Path $idx) { foreach ($l in (Get-Content $idx)) { try { $o = $l | ConvertFrom-Json; if ($o.id) { $titles[[string]$o.id] = [string]$o.thread_name } } catch { } } }
+
+    if ($List) {
+        Write-Host "Recent Codex threads (newest first):" -ForegroundColor Cyan
+        $shown = 0
+        foreach ($f in ($files | Sort-Object LastWriteTime -Descending)) {
+            $info = Get-CodexSessionInfo $f.FullName @() $titles
+            if (-not $info) { continue }
+            $shown++
+            $label = $(if ($info.Title) { $info.Title } elseif ($info.FirstPrompt) { ($info.FirstPrompt -replace '\s+', ' ').Trim() } else { '(no prompt)' })
+            if ($label.Length -gt 64) { $label = $label.Substring(0, 64) + '...' }
+            Write-Host ("  {0}  {1,-22}  {2}  {3}" -f (Format-ChatTimestamp $info.LastTs), $info.Project, $(if ($info.Id) { $info.Id.Substring(0, 8) } else { '????????' }), $label)
+            if ($shown -ge $Limit) { break }
+        }
+        exit 0
+    }
+    if (-not $Name) { Write-Error "Provide -Name to search, or -List."; exit 1 }
+    $terms = @($Name -split '\s+' | Where-Object { $_ })
+    Write-Host "Searching Codex transcripts ($($files.Count) files) for: $($terms -join ' + ')" -ForegroundColor Cyan
+    $hitPaths = @($files | Select-Object -ExpandProperty FullName)
+    foreach ($term in $terms) {
+        if (-not $hitPaths.Count) { break }
+        $hitPaths = @(Select-String -Path $hitPaths -Pattern $term -SimpleMatch -List -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path)
+    }
+    if (-not $hitPaths.Count) { Write-Warning "No Codex thread contains all of: $($terms -join ', ')"; exit 1 }
+    $infos = @()
+    foreach ($p in $hitPaths) { $info = Get-CodexSessionInfo $p $terms $titles; if ($info -and $info.TermsFound -gt 0) { $infos += $info } }
+    if (-not $infos.Count) { Write-Warning "No conversational matches for '$Name' (terms only appeared in injected context)."; exit 1 }
+    $full = @($infos | Where-Object { $_.AllPresent })
+    $show = $(if ($full.Count) { $full } else { $infos })
+    if (-not $full.Count) { Write-Host "(no thread had all terms in-conversation; showing closest partial matches)" -ForegroundColor DarkYellow }
+    $show = @($show | Sort-Object LastTs -Descending | Select-Object -First $Limit)
+    Write-Host ""
+    $i = 0
+    foreach ($info in $show) {
+        $i++
+        $range = (Format-ChatTimestamp $info.FirstTs) + ' -> ' + (Format-ChatTimestamp $info.LastTs)
+        $tag = $(if ($info.AllPresent) { "   (all terms, $($info.MsgMatches) msgs)" } else { "   ($($info.TermsFound)/$($info.TermsTotal) terms)" })
+        $head = $(if ($info.Title) { "$($info.Project)  -  $($info.Title)" } else { $info.Project })
+        Write-Host ("[{0}] {1}   {2}{3}" -f $i, $head, $range, $tag) -ForegroundColor Green
+        Write-Host "     $($info.Path)" -ForegroundColor DarkGray
+        foreach ($s in $info.Snippets) { Write-Host "     $s" -ForegroundColor Gray }
+        if ($info.Id) { Write-Host "     resume:  codex resume $($info.Id)" -ForegroundColor Cyan }
+        Write-Host ""
+    }
+    exit 0
+}
 
 if ($Code) {
     $base = Join-Path $env:USERPROFILE '.claude\projects'

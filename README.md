@@ -16,6 +16,11 @@ The PowerShell tool searches **four** stores:
 3. **Everything on claude.ai** (`-Cloud`) — full-text search of every claude.ai chat and every Claude Code session (local *and* cloud, incl. ones started from the phone app), by driving the desktop app's own Search palette (server-side index).
 4. **Scheduled-task runs / Cowork sessions** (`-Scheduled`) — the `https://claude.ai/cowork/cse_*` sessions that a scheduled task (e.g. *Morning brief*) produces. These have no local transcript and are **not** in the palette's index, so they're listed by date from the task's page and opened from there.
 
+…and, despite the name, two OpenAI stores too:
+
+5. **Codex** (`-Codex`) — OpenAI Codex desktop/CLI transcripts on disk under `~/.codex/sessions/**/rollout-*.jsonl` (+ `archived_sessions`), titles from `session_index.jsonl`. Greppable, no app needed.
+6. **ChatGPT** (`-ChatGPT`) — ChatGPT chats keep **no local copy** on Windows (the app's cache was checked: zero conversation bodies), but the ChatGPT desktop app's Ctrl+K command menu is a server-side search over every ChatGPT chat *and* every Codex thread, with snippets. `-ChatGPT` drives it via UIA (launches the app if needed).
+
 ## Why this exists
 
 The Claude **desktop app** stores history server-side on claude.ai — no local file to grep. But the running app exposes its sidebar through Windows Accessibility (UIA), so we enumerate the conversation buttons and click the right one.
@@ -48,6 +53,11 @@ The Claude **desktop app** stores history server-side on claude.ai — no local 
 .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Name "Today" -Open   # open today's run in the app
 .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Find "chatgpt pro subscription" -Open   # search INSIDE the runs
 .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Find "kling" -Limit 40 -Refresh         # re-read, ignore cache
+
+# ── OpenAI: Codex transcripts on disk (-Codex) and ChatGPT app search (-ChatGPT) ──
+.\Find-ClaudeChat.ps1 -Codex -Name "claude watchdog"        # AND across real turns; prints `codex resume <id>`
+.\Find-ClaudeChat.ps1 -Codex -List
+.\Find-ClaudeChat.ps1 -ChatGPT -Name "hermes" -Open         # ChatGPT chats + Codex threads, server-side, opens top hit
 ```
 
 `-Cloud` prints, per hit, the kind (`chat` / `code` / `cowork` / `task`) and a URL or `claude --resume` line. `-Scheduled` prints each run's `https://claude.ai/cowork/cse_…` link; `-Name` matches the run's date label (`Today`, `Yesterday`, `Sep 21`). `-Find` reads the runs' actual content: it opens each run in the app (newest first, up to `-Limit`, ~2 s each), extracts the rendered conversation, caches it in `%LOCALAPPDATA%\find-claude-chat\runs\<cse_id>.txt`, and AND-matches whole words with snippets. Cached runs are instant on later searches; runs still marked *Awaiting input* / *Unread* are re-read each time.
@@ -119,8 +129,20 @@ date, and a snippet. Dependency: `zstandard` (`pip3 install zstandard`); falls b
 4. Whole-word AND-matches the search terms against the decoded message text, dedupes to the richest cache entry per conversation uuid
 5. Ranks by match count then last-active, and prints the title, a `https://claude.ai/chat/<uuid>` link, and a snippet
 
+**Codex (`-Codex`):**
+1. Enumerates `~/.codex/sessions/**/rollout-*.jsonl` and `~/.codex/archived_sessions/*.jsonl`; `session_index.jsonl` maps thread id → title
+2. AND-prefilters with `Select-String`, then parses events: `payload.type == 'message'` with `role` user/assistant, text in `payload.content[].text`; injected `<app-context>` / `<recommended_plugins>` / `<environment_context>` user blocks are skipped
+3. Whole-word matching, ranks full-term matches first then most recent, prints the rollout path and a `codex resume <id>` line
+
+**ChatGPT app (`-ChatGPT`):**
+1. Finds the window named "ChatGPT" owned by a `ChatGPT*` process (launches `shell:AppsFolder\OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!App` if absent) and waits for the renderer's UIA tree
+2. Invokes the sidebar **Search** button → "Command menu" combobox; snapshots the static entries shown with an empty query (settings, New chat…) as a baseline
+3. Sets the query via `ValuePattern`, waits, reads the `radix-*` list items minus the baseline. `"<title> ChatGPT Ctrl+N"` = ChatGPT chat; `"<title> <cwd-slug> Ctrl+N ... <snippet>"` = Codex thread
+4. `-Open` invokes the top item, otherwise Esc closes the menu
+
 ## Notes
 
+- **ChatGPT chats** have no on-disk copy on Windows — the app cache under `%LOCALAPPDATA%\Packages\OpenAI.ChatGPT-Desktop_*\LocalCache\Roaming\ChatGPT\Cache` held zero conversation bodies when checked (2026-09-23). `-ChatGPT` therefore needs the app running and signed in.
 - **Cowork sessions** (`claude.ai/cowork/cse_*`, incl. every scheduled-task run) are cloud-only: no local file, and as of 2026-09-23 the desktop palette does not full-text index them. `-Scheduled` is the only way to reach them from this script, and only by date. Ad-hoc Cowork sessions that aren't task runs: use the web UI.
 - **Desktop:** only sidebar-visible conversations can be found; scroll the sidebar first if a chat isn't showing. Matches the first result — use `-List` to disambiguate.
 - **-Code:** multi-word `-Name` is an AND across the conversation, not an exact phrase. Use `-Project <substr>` to scope by working directory, `-IncludeAgents` to include the agent's own SDK sessions, and `-Limit` to widen the recency cap.
