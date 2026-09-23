@@ -46,9 +46,11 @@ The Claude **desktop app** stores history server-side on claude.ai — no local 
 .\Find-ClaudeChat.ps1 -Scheduled                                       # list scheduled tasks
 .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief"                 # list that task's runs + cse_ URLs
 .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Name "Today" -Open   # open today's run in the app
+.\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Find "chatgpt pro subscription" -Open   # search INSIDE the runs
+.\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Find "kling" -Limit 40 -Refresh         # re-read, ignore cache
 ```
 
-`-Cloud` prints, per hit, the kind (`chat` / `code` / `cowork` / `task`) and a URL or `claude --resume` line. `-Scheduled` prints each run's `https://claude.ai/cowork/cse_…` link; `-Name` matches the run's date label (`Today`, `Yesterday`, `Sep 21`).
+`-Cloud` prints, per hit, the kind (`chat` / `code` / `cowork` / `task`) and a URL or `claude --resume` line. `-Scheduled` prints each run's `https://claude.ai/cowork/cse_…` link; `-Name` matches the run's date label (`Today`, `Yesterday`, `Sep 21`). `-Find` reads the runs' actual content: it opens each run in the app (newest first, up to `-Limit`, ~2 s each), extracts the rendered conversation, caches it in `%LOCALAPPDATA%\find-claude-chat\runs\<cse_id>.txt`, and AND-matches whole words with snippets. Cached runs are instant on later searches; runs still marked *Awaiting input* / *Unread* are re-read each time.
 
 Each `-Code` result shows the project, date range, match count, a snippet, and a ready-to-run `claude --resume <id>` command.
 
@@ -108,6 +110,7 @@ date, and a snippet. Dependency: `zstandard` (`pip3 install zstandard`); falls b
 1. Palette → `Scheduled` tab lists the tasks (`trig_…`); the chosen task is invoked, which navigates to its page
 2. The page lists runs as hyperlinks (`Today at 9:12 AM`, …); each hyperlink's `ValuePattern` is the `https://claude.ai/cowork/cse_…` URL
 3. `-Name` matches the date label, `-Open` invokes that hyperlink
+4. `-Find`: for each run, invoke its link → wait until the "Primary pane" text stops growing → collect every Text/ListItem/Hyperlink name inside that pane (sidebar excluded) → cache → press **Back** and re-bind the run links (the page re-renders). Matching is whole-word, case-insensitive, AND across terms
 
 **macOS desktop cache (`find-claude-chat-mac.py`):**
 1. Enumerates Chromium Simple Cache entries under `~/Library/Application Support/Claude/Cache/Cache_Data/*_0`

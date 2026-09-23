@@ -42,6 +42,23 @@
     indexes them), then opens https://claude.ai/cowork in your default browser
     where you can search/scroll the session list yourself.
 
+.PARAMETER Scheduled
+    List scheduled tasks; with -Task "<name>" open that task's page and list its
+    runs (each run is a Cowork session, URL printed). -Name matches the run's
+    date label ("Today", "Sep 21"); -Open opens it in the app.
+
+.PARAMETER Task
+    With -Scheduled: partial name of the scheduled task (e.g. "Morning brief").
+
+.PARAMETER Find
+    With -Scheduled -Task: full-text search INSIDE the runs. Opens each run in
+    the app (newest first, up to -Limit), reads the rendered conversation, and
+    caches it under %LOCALAPPDATA%\find-claude-chat\runs\<cse_id>.txt so later
+    searches are instant. Multi-word = AND. -Open opens the top match.
+
+.PARAMETER Refresh
+    With -Find: ignore the cache and re-read every run.
+
 .PARAMETER Type
     With -Cloud: palette filter tab - All (default), Sessions (claude.ai chats),
     Code (Claude Code sessions), Projects, Artifacts, Scheduled.
@@ -73,6 +90,8 @@
     .\Find-ClaudeChat.ps1 -Cloud -Name "chatgpt subscription"           # all claude.ai chats + Code sessions
     .\Find-ClaudeChat.ps1 -Cloud -Name "kling credits" -Type Sessions -Open
     .\Find-ClaudeChat.ps1 -Cowork -Name "chatgpt subscription"
+    .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief"                       # list runs + cse_ URLs
+    .\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Find "chatgpt pro subscription" -Open
 
 .NOTES
     Desktop-app modes require the Claude desktop app running and use Windows UI
@@ -91,6 +110,8 @@ param(
     [switch]$Cowork,
     [switch]$Scheduled,
     [string]$Task,
+    [string]$Find,
+    [switch]$Refresh,
     [ValidateSet('All','Sessions','Code','Projects','Artifacts','Scheduled')]
     [string]$Type = 'All',
     [switch]$Open,
@@ -240,6 +261,46 @@ function Get-ScheduledRunLinks($window) {
         $out += [PSCustomObject]@{ Label = $c.Name; Href = $href; Y = $r.Y; Element = $l }
     }
     return $out | Sort-Object Y
+}
+
+# Text of the run currently open in the app: every Text/ListItem node inside
+# the "Primary pane" group (excludes the sidebar). Read after the page settles.
+function Get-OpenRunText($window) {
+    $pane = $window.FindFirst(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, 'Primary pane'
+        )
+    )
+    if (-not $pane) { return $null }
+    $sb = New-Object System.Text.StringBuilder
+    $els = $pane.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    foreach ($e in $els) {
+        $c = $e.Current
+        if ($c.ControlType.Id -notin 50020, 50007, 50005) { continue }   # Text, ListItem, Hyperlink
+        if (-not $c.Name -or $c.Name -eq 'Use the up and down arrow keys to move between messages.') { continue }
+        [void]$sb.AppendLine($c.Name)
+    }
+    return $sb.ToString()
+}
+
+function Wait-RunLoaded($window, [int]$maxMs = 8000) {
+    # wait until the pane text stops growing (page + lazy sections rendered)
+    $last = -1; $stable = 0; $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $maxMs) {
+        Start-Sleep -Milliseconds 400
+        $t = Get-OpenRunText $window
+        $len = $(if ($t) { $t.Length } else { 0 })
+        if ($len -gt 200 -and $len -eq $last) { $stable++; if ($stable -ge 2) { return $t } } else { $stable = 0 }
+        $last = $len
+    }
+    return (Get-OpenRunText $window)
+}
+
+function Get-RunCacheDir {
+    $d = Join-Path $env:LOCALAPPDATA 'find-claude-chat\runs'
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    return $d
 }
 
 function Invoke-UiaElement($el) {
@@ -546,6 +607,78 @@ if ($Scheduled) {
     $runs = @()
     for ($n = 0; $n -lt 25 -and -not $runs.Count; $n++) { Start-Sleep -Milliseconds 200; $runs = @(Get-ScheduledRunLinks $win) }
     if (-not $runs.Count) { Write-Warning "Task page opened but no run rows were found."; exit 1 }
+
+    # ── -Find: full-text search INSIDE the runs (opens each run, reads it, caches) ──
+    if ($Find) {
+        $terms = @($Find -split '\s+' | Where-Object { $_ })
+        $cacheDir = Get-RunCacheDir
+        $toScan = @($runs | Select-Object -First $Limit)
+        Write-Host "Reading $($toScan.Count) run(s) of '$($pick.Label)' for: $($terms -join ' + ')   (cache: $cacheDir)" -ForegroundColor Cyan
+        $results = @()
+        $idx = 0
+        foreach ($r in $toScan) {
+            $idx++
+            $id = $(if ($r.Href -match '(cse_[A-Za-z0-9]+)') { $Matches[1] } else { $null })
+            $cacheFile = $(if ($id) { Join-Path $cacheDir "$id.txt" } else { $null })
+            $text = $null
+            # runs still "Awaiting input"/"Unread" may grow; only trust cache for settled runs unless -Refresh
+            $settled = ($r.Label -notmatch 'Awaiting input|Unread response|Running')
+            if ($cacheFile -and -not $Refresh -and $settled -and (Test-Path $cacheFile)) {
+                $text = Get-Content -LiteralPath $cacheFile -Raw
+                Write-Host ("  [{0}/{1}] {2}  (cached)" -f $idx, $toScan.Count, $r.Label) -ForegroundColor DarkGray
+            } else {
+                Write-Host ("  [{0}/{1}] {2}  opening..." -f $idx, $toScan.Count, $r.Label) -ForegroundColor DarkGray
+                try { Invoke-UiaElement $r.Element } catch { Write-Warning "  could not open '$($r.Label)': $_"; continue }
+                $text = Wait-RunLoaded $win
+                if ($text -and $cacheFile) { [System.IO.File]::WriteAllText($cacheFile, "# $($r.Label)`n# $($r.Href)`n$text") }
+                # go back to the task page so the next run link is available again
+                $back = $null
+                for ($n = 0; $n -lt 20 -and -not $back; $n++) {
+                    Start-Sleep -Milliseconds 200
+                    $back = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)) |
+                        Where-Object { $_.Current.Name -eq 'Back' } | Select-Object -First 1
+                }
+                if ($back) { Invoke-UiaElement $back }
+                $fresh = @()
+                for ($n = 0; $n -lt 25 -and -not $fresh.Count; $n++) { Start-Sleep -Milliseconds 200; $fresh = @(Get-ScheduledRunLinks $win) }
+                # re-bind remaining run elements (the page was re-rendered)
+                foreach ($f in $fresh) { $m = $toScan | Where-Object { $_.Href -eq $f.Href } ; if ($m) { $m.Element = $f.Element } }
+            }
+            if (-not $text) { continue }
+            $found = @(); $flat = ($text -replace '\s+', ' ')
+            # whole-word match so "pro" doesn't hit "/ui-ux-pro-max" in the rendered skill list
+            foreach ($term in $terms) { if ($flat -match ('(?i)\b' + [regex]::Escape($term) + '\b')) { $found += $term } }
+            if ($found.Count) {
+                $snips = @()
+                foreach ($term in ($found | Sort-Object { $_.Length } -Descending | Select-Object -First 2)) {   # longest terms give the most specific snippets
+                    $m = [regex]::Match($flat, '(?i)\b' + [regex]::Escape($term) + '\b')
+                    $start = [Math]::Max(0, $m.Index - 60); $len = [Math]::Min(180, $flat.Length - $start)
+                    $snips += ('[run] ' + $(if ($start -gt 0) { '...' } else { '' }) + $flat.Substring($start, $len) + '...')
+                }
+                $results += [PSCustomObject]@{ Run = $r; Found = $found.Count; Total = $terms.Count; Snippets = $snips }
+            }
+        }
+        if (-not $results.Count) { Write-Warning "No run of '$($pick.Label)' contains any of: $($terms -join ', ')"; exit 1 }
+        $full = @($results | Where-Object { $_.Found -eq $_.Total })
+        $show = $(if ($full.Count) { $full } else { $results | Sort-Object Found -Descending })
+        if (-not $full.Count) { Write-Host "(no run had all terms; showing partial matches)" -ForegroundColor DarkYellow }
+        Write-Host ""
+        $i = 0
+        foreach ($m in $show) {
+            $i++
+            Write-Host ("[{0}] {1}   ({2}/{3} terms)" -f $i, $m.Run.Label, $m.Found, $m.Total) -ForegroundColor Green
+            Write-Host "     $($m.Run.Href)" -ForegroundColor Cyan
+            foreach ($s in $m.Snippets) { Write-Host "     $s" -ForegroundColor Gray }
+        }
+        if ($Open) {
+            $top = $show[0].Run
+            $cur = Get-ScheduledRunLinks $win | Where-Object { $_.Href -eq $top.Href } | Select-Object -First 1
+            if ($cur) { Write-Host "Opening run: $($top.Label)" -ForegroundColor Green; Invoke-UiaElement $cur.Element }
+        }
+        exit 0
+    }
+
     Write-Host "Runs (newest first) - each is a Cowork session:" -ForegroundColor Cyan
     $i = 0
     foreach ($r in ($runs | Select-Object -First $Limit)) {
