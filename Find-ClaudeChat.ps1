@@ -28,6 +28,27 @@
     full-match-first then most-recently-active, each showing project, date range,
     snippet, session id, and a ready-to-run `claude --resume` command.
 
+.PARAMETER Cloud
+    Full-text search of EVERY claude.ai chat and Claude Code session (local and
+    cloud, including sessions started from the phone app) by driving the desktop
+    app's own Search palette (server-side index). Needs the app running. Use
+    -Type to restrict to Sessions / Code / Projects. -Open opens the top hit.
+    Cowork sessions are NOT in this index (verified 2026-09-23) - see -Cowork.
+
+.PARAMETER Cowork
+    Cowork sessions (https://claude.ai/cowork/cse_*) have no local transcript and
+    the desktop app's palette does not index them, so the only search surface is
+    the web UI. -Cowork runs the -Cloud search first (in case a future app build
+    indexes them), then opens https://claude.ai/cowork in your default browser
+    where you can search/scroll the session list yourself.
+
+.PARAMETER Type
+    With -Cloud: palette filter tab - All (default), Sessions (claude.ai chats),
+    Code (Claude Code sessions), Projects, Artifacts, Scheduled.
+
+.PARAMETER Open
+    With -Cloud -Name: open the top matching result in the app.
+
 .PARAMETER Resume
     With -Code -Name, immediately resume the top matching Claude Code session
     (runs `claude --resume <id>` in that session's working directory).
@@ -49,6 +70,9 @@
     .\Find-ClaudeChat.ps1 -Code -Name "hermes dashboard" -Project hermes-deployment
     .\Find-ClaudeChat.ps1 -Code -Name "hermes desktop" -Resume
     .\Find-ClaudeChat.ps1 -Code -List
+    .\Find-ClaudeChat.ps1 -Cloud -Name "chatgpt subscription"           # all claude.ai chats + Code sessions
+    .\Find-ClaudeChat.ps1 -Cloud -Name "kling credits" -Type Sessions -Open
+    .\Find-ClaudeChat.ps1 -Cowork -Name "chatgpt subscription"
 
 .NOTES
     Desktop-app modes require the Claude desktop app running and use Windows UI
@@ -63,6 +87,13 @@ param(
     [switch]$List,
     [switch]$ListProjects,
     [switch]$Code,
+    [switch]$Cloud,
+    [switch]$Cowork,
+    [switch]$Scheduled,
+    [string]$Task,
+    [ValidateSet('All','Sessions','Code','Projects','Artifacts','Scheduled')]
+    [string]$Type = 'All',
+    [switch]$Open,
     [switch]$Resume,
     [switch]$IncludeAgents,
     [int]$Limit = 20
@@ -80,12 +111,135 @@ public class WinFocusClaude {
 "@
 
 function Get-ClaudeWindow {
-    return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+    # The MAIN window is named "Claude". Popped-out session windows carry the
+    # chat title instead, so match by process AND name, not name alone.
+    $claudePids = @(Get-Process claude -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    if (-not $claudePids.Count) { return $null }
+    $tops = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
         [System.Windows.Automation.TreeScope]::Children,
+        [System.Windows.Automation.Condition]::TrueCondition
+    ) | Where-Object { $_.Current.ProcessId -in $claudePids }
+    $main = $tops | Where-Object { $_.Current.Name -eq 'Claude' } | Select-Object -First 1
+    if ($main) { return $main }
+    return $tops | Select-Object -First 1
+}
+
+function Get-ByAutomationId($window, [string]$id) {
+    return $window.FindFirst(
+        [System.Windows.Automation.TreeScope]::Descendants,
         [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::NameProperty, "Claude"
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $id
         )
     )
+}
+
+# ── Cloud search via the app's command palette (Ctrl+K "Search") ───────────────
+# The palette is a server-side full-text search over every claude.ai chat AND
+# every Claude Code session (local + cloud). Result ids: "local_<guid>" = Code
+# session, plain guid = claude.ai chat. NOTE: Cowork sessions (claude.ai/cowork/
+# cse_*) were NOT indexed by the palette as of 2026-09-23 — see -Cowork.
+
+function Open-CommandPalette($window) {
+    $input = Get-ByAutomationId $window 'command-palette-input'
+    if ($input) { return $input }
+    $searchBtn = $window.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        )
+    ) | Where-Object { $_.Current.Name -eq 'Search' } | Select-Object -First 1
+    if (-not $searchBtn) { return $null }
+    Invoke-UiaElement $searchBtn
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 150
+        $input = Get-ByAutomationId $window 'command-palette-input'
+        if ($input) { return $input }
+    }
+    return $null
+}
+
+function Close-CommandPalette($window) {
+    $close = $window.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        )
+    ) | Where-Object { $_.Current.Name -eq 'Close' -and $_.Current.AutomationId -like '_r_*' } | Select-Object -First 1
+    if ($close) { try { Invoke-UiaElement $close } catch { } }
+}
+
+function Search-CloudSessions($window, [string]$query, [string]$typeTab) {
+    $input = Open-CommandPalette $window
+    if (-not $input) { throw "Could not open the app's Search palette (no 'Search' button / palette input found)." }
+    $input.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($query)
+    Start-Sleep -Milliseconds 3000
+    if ($typeTab) {
+        $tab = $window.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::TabItem
+            )
+        ) | Where-Object { $_.Current.Name -eq $typeTab } | Select-Object -First 1
+        if ($tab) {
+            $tab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+            Start-Sleep -Milliseconds 2500
+        } else { Write-Warning "Palette has no '$typeTab' filter tab; showing all types." }
+    }
+    $list = Get-ByAutomationId $window 'command-palette-results'
+    if ($env:FINDCLAUDECHAT_DEBUG) { Write-Host "   [debug] window='$($window.Current.Name)' input=$($null -ne $input) value='$($input.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value)' list=$($null -ne $list)" -ForegroundColor DarkGray }
+    if (-not $list) { return @() }
+    $items = $list.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::ListItem
+        )
+    )
+    $out = @()
+    foreach ($it in $items) {
+        $aid = [string]$it.Current.AutomationId
+        if ($aid -notlike 'command-palette-item-*') { continue }
+        $id = $aid.Substring('command-palette-item-'.Length)
+        # skip actions / filters (new_code_session, send_message, delete_chat, filter-value:..)
+        $kind = $null
+        if ($id -match '^local_[0-9a-f]{8}-') { $kind = 'code' }
+        elseif ($id -match '^cse_') { $kind = 'cowork' }          # Cowork / scheduled-task session
+        elseif ($id -match '^trig_') { $kind = 'task' }           # a scheduled task (its runs are cse_ sessions)
+        elseif ($id -match '^[0-9a-f]{8}-[0-9a-f]{4}-') { $kind = 'chat' }
+        else { if ($env:FINDCLAUDECHAT_DEBUG) { Write-Host "   (skip $id)" -ForegroundColor DarkGray }; continue }
+        $out += [PSCustomObject]@{ Kind = $kind; Id = $id; Label = [string]$it.Current.Name; Element = $it }
+    }
+    return $out
+}
+
+# ── Scheduled-task runs (the Cowork sessions the palette can't see) ───────────
+# Each scheduled task (e.g. "Morning brief") has a page listing its runs as
+# hyperlinks ("Today at 9:12 AM", "Sep 21 at 9:06 AM Awaiting input"). Each run
+# IS a Cowork session (https://claude.ai/cowork/cse_*). Run bodies are not
+# full-text indexed anywhere on the desktop, so this lists/opens runs by date.
+
+function Get-ScheduledRunLinks($window) {
+    $links = $window.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Hyperlink
+        )
+    )
+    $out = @()
+    foreach ($l in $links) {
+        $c = $l.Current; $r = $c.BoundingRectangle
+        if ([double]::IsInfinity($r.X)) { continue }
+        # run rows: "Today at 9:12 AM", "Yesterday at 9:05 AM", "Sep 21 at 9:06 AM Awaiting input"
+        if ($c.Name -notmatch '^(Today|Yesterday|[A-Z][a-z]{2} \d{1,2}(, \d{4})?) at \d{1,2}:\d{2} [AP]M') { continue }
+        $href = $null
+        try { $href = [string]$l.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { }
+        $out += [PSCustomObject]@{ Label = $c.Name; Href = $href; Y = $r.Y; Element = $l }
+    }
+    return $out | Sort-Object Y
 }
 
 function Invoke-UiaElement($el) {
@@ -368,6 +522,88 @@ if ($Code) {
 
 $win = Get-ClaudeWindow
 if (-not $win) { Write-Error "Claude desktop app not running."; exit 1 }
+
+# ── -Scheduled: list / open the runs of a scheduled task (Cowork sessions) ────
+if ($Scheduled) {
+    Write-Host "Scheduled tasks (via palette):" -ForegroundColor Cyan
+    $tasks = @()
+    try { $tasks = @(Search-CloudSessions $win '' 'Scheduled' | Where-Object { $_.Kind -eq 'task' }) }
+    catch { Write-Error $_; exit 1 }
+    if (-not $tasks.Count) { Close-CommandPalette $win; Write-Warning "No scheduled tasks listed in the palette."; exit 1 }
+    $i = 0
+    foreach ($t in $tasks) { $i++; Write-Host ("  [{0}] {1}   ({2})" -f $i, $t.Label, $t.Id) }
+    $pick = $null
+    if ($Task) { $pick = $tasks | Where-Object { $_.Label -like "*$Task*" } | Select-Object -First 1 }
+    elseif ($tasks.Count -eq 1) { $pick = $tasks[0] }
+    if (-not $pick) {
+        Close-CommandPalette $win
+        if ($Task) { Write-Warning "No scheduled task matching '*$Task*'." } else { Write-Host "Pass -Task <name> to list a task's runs." -ForegroundColor Yellow }
+        exit $(if ($Task) { 1 } else { 0 })
+    }
+    Write-Host "Opening task page: $($pick.Label)" -ForegroundColor Cyan
+    Focus-ClaudeWindow
+    Invoke-UiaElement $pick.Element
+    $runs = @()
+    for ($n = 0; $n -lt 25 -and -not $runs.Count; $n++) { Start-Sleep -Milliseconds 200; $runs = @(Get-ScheduledRunLinks $win) }
+    if (-not $runs.Count) { Write-Warning "Task page opened but no run rows were found."; exit 1 }
+    Write-Host "Runs (newest first) - each is a Cowork session:" -ForegroundColor Cyan
+    $i = 0
+    foreach ($r in ($runs | Select-Object -First $Limit)) {
+        $i++
+        $hit = $(if ($Name -and $r.Label -like "*$Name*") { '  <== match' } else { '' })
+        Write-Host ("  [{0}] {1}{2}" -f $i, $r.Label, $hit) -ForegroundColor $(if ($hit) { 'Green' } else { 'White' })
+        if ($r.Href) { Write-Host "       $($r.Href)" -ForegroundColor DarkGray }
+    }
+    $target = $(if ($Name) { $runs | Where-Object { $_.Label -like "*$Name*" } | Select-Object -First 1 } else { $runs[0] })
+    if ($Open -and $target) {
+        Write-Host "Opening run: $($target.Label)" -ForegroundColor Green
+        Invoke-UiaElement $target.Element
+    } elseif ($Name -and -not $target) {
+        Write-Warning "No run matching '*$Name*' (match on the date label, e.g. 'Today', 'Sep 21')."
+        exit 1
+    }
+    exit 0
+}
+
+# ── -Cloud / -Cowork: server-side search through the app's palette ────────────
+if ($Cloud -or $Cowork) {
+    if (-not $Name) { Write-Error "Provide -Name to search."; exit 1 }
+    $tab = $(if ($Type -eq 'All') { $null } else { $Type })
+    Write-Host "Searching claude.ai + Claude Code sessions (palette, type=$Type) for: $Name" -ForegroundColor Cyan
+    $hits = @()
+    try { $hits = @(Search-CloudSessions $win $Name $tab) }
+    catch { Write-Error $_; exit 1 }
+    if (-not $hits.Count) {
+        Write-Warning "No palette results for '$Name'."
+    } else {
+        $i = 0
+        foreach ($h in ($hits | Select-Object -First $Limit)) {
+            $i++
+            $url = switch ($h.Kind) {
+                'code'   { "claude --resume $($h.Id.Substring(6))" }
+                'cowork' { "https://claude.ai/cowork/$($h.Id)" }
+                'task'   { "scheduled task - runs: .\Find-ClaudeChat.ps1 -Scheduled -Task `"$(($h.Label -split ' (Weekdays|Daily|Every|Weekly|Monthly|Scheduled)')[0])`"" }
+                default  { "https://claude.ai/chat/$($h.Id)" }
+            }
+            Write-Host ("[{0}] {1,-4} {2}" -f $i, $h.Kind, $h.Label) -ForegroundColor Green
+            Write-Host "     $url" -ForegroundColor DarkGray
+        }
+    }
+    if ($Open -and $hits.Count) {
+        Write-Host "Opening: $($hits[0].Label)" -ForegroundColor Green
+        Focus-ClaudeWindow
+        Invoke-UiaElement $hits[0].Element
+    } else {
+        Close-CommandPalette $win
+    }
+    if ($Cowork) {
+        Write-Host ""
+        Write-Host "Cowork session bodies are not in the desktop app's index. If the chat was a scheduled-task run (e.g. Morning brief), list those with:" -ForegroundColor Yellow
+        Write-Host "    .\Find-ClaudeChat.ps1 -Scheduled -Task 'Morning brief' [-Name 'Today' -Open]" -ForegroundColor Yellow
+        Write-Host "Otherwise search the web UI: https://claude.ai/cowork" -ForegroundColor Yellow
+    }
+    exit $(if ($hits.Count) { 0 } else { 1 })
+}
 
 # Navigate to Projects page first if needed
 if ($ListProjects -or $Project) {

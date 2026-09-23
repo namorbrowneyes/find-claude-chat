@@ -2,16 +2,19 @@
 
 Find a past Claude conversation by topic. Two tools, one per platform:
 
-- **Windows** — `Find-ClaudeChat.ps1` (PowerShell). Searches the running desktop app's
-  sidebar via UI Automation, and Claude Code transcripts via `-Code`.
+- **Windows** — `Find-ClaudeChat.ps1` (PowerShell). Searches the running desktop app via
+  UI Automation (sidebar, the app's own Search palette, scheduled-task runs) and Claude
+  Code transcripts via `-Code`.
 - **macOS** — `find-claude-chat-mac.py` (Python). Searches the desktop app's local HTTP
   cache, since macOS has no UIA. Decompresses the cached conversation bodies and greps the
   real message text by topic.
 
-The PowerShell tool searches **two** stores:
+The PowerShell tool searches **four** stores:
 
-1. **Claude desktop app** — the running app's sidebar/projects, via Windows UI Automation.
+1. **Claude desktop app sidebar** — the running app's sidebar/projects, via Windows UI Automation.
 2. **Claude Code** (`-Code`) — your local CLI transcripts under `~/.claude/projects/**/*.jsonl`.
+3. **Everything on claude.ai** (`-Cloud`) — full-text search of every claude.ai chat and every Claude Code session (local *and* cloud, incl. ones started from the phone app), by driving the desktop app's own Search palette (server-side index).
+4. **Scheduled-task runs / Cowork sessions** (`-Scheduled`) — the `https://claude.ai/cowork/cse_*` sessions that a scheduled task (e.g. *Morning brief*) produces. These have no local transcript and are **not** in the palette's index, so they're listed by date from the task's page and opened from there.
 
 ## Why this exists
 
@@ -33,7 +36,19 @@ The Claude **desktop app** stores history server-side on claude.ai — no local 
 .\Find-ClaudeChat.ps1 -Code -Name "hermes desktop" -Resume  # resume the top match in its cwd
 .\Find-ClaudeChat.ps1 -Code -List                           # recent Claude Code chats
 .\Find-ClaudeChat.ps1 -Code -Name "agent" -IncludeAgents    # also include programmatic SDK/agent runs
+
+# ── Everything on claude.ai (-Cloud, needs the app running) ──
+.\Find-ClaudeChat.ps1 -Cloud -Name "chatgpt subscription"             # chats + Code sessions, full text
+.\Find-ClaudeChat.ps1 -Cloud -Name "kling credits" -Type Sessions -Open # -Type: All|Sessions|Code|Projects|Artifacts|Scheduled
+.\Find-ClaudeChat.ps1 -Cowork -Name "chatgpt subscription"             # -Cloud + pointers for Cowork sessions
+
+# ── Scheduled-task runs = Cowork sessions (-Scheduled) ──
+.\Find-ClaudeChat.ps1 -Scheduled                                       # list scheduled tasks
+.\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief"                 # list that task's runs + cse_ URLs
+.\Find-ClaudeChat.ps1 -Scheduled -Task "Morning brief" -Name "Today" -Open   # open today's run in the app
 ```
+
+`-Cloud` prints, per hit, the kind (`chat` / `code` / `cowork` / `task`) and a URL or `claude --resume` line. `-Scheduled` prints each run's `https://claude.ai/cowork/cse_…` link; `-Name` matches the run's date label (`Today`, `Yesterday`, `Sep 21`).
 
 Each `-Code` result shows the project, date range, match count, a snippet, and a ready-to-run `claude --resume <id>` command.
 
@@ -83,6 +98,17 @@ date, and a snippet. Dependency: `zstandard` (`pip3 install zstandard`); falls b
 4. Deep-parses each candidate, scoring matches in real conversation turns only (skips `<system-reminder>` / `CLAUDE.md` / memory blocks)
 5. Ranks full-term matches first, then most-recently-active, and prints a `claude --resume` line per hit
 
+**Cloud (`-Cloud`):**
+1. Finds the app's **main** window (named "Claude"; popped-out session windows carry the chat title and are skipped)
+2. Invokes the sidebar **Search** button → command palette (`AutomationId command-palette-input`), sets the query via `ValuePattern`
+3. Optionally selects a filter tab (`Sessions`, `Code`, …), then reads `command-palette-results` list items. Item ids tell the kind: `local_<guid>` = Claude Code session, `<guid>` = claude.ai chat, `cse_…` = Cowork session, `trig_…` = scheduled task
+4. `-Open` invokes the top item; otherwise the palette is closed again
+
+**Scheduled runs (`-Scheduled`):**
+1. Palette → `Scheduled` tab lists the tasks (`trig_…`); the chosen task is invoked, which navigates to its page
+2. The page lists runs as hyperlinks (`Today at 9:12 AM`, …); each hyperlink's `ValuePattern` is the `https://claude.ai/cowork/cse_…` URL
+3. `-Name` matches the date label, `-Open` invokes that hyperlink
+
 **macOS desktop cache (`find-claude-chat-mac.py`):**
 1. Enumerates Chromium Simple Cache entries under `~/Library/Application Support/Claude/Cache/Cache_Data/*_0`
 2. Parses each file's Simple Cache header (magic `0xfcfb6d1ba7725c30`) to read the request URL (the cache key); keeps only `chat_conversations/<uuid>` responses
@@ -92,6 +118,7 @@ date, and a snippet. Dependency: `zstandard` (`pip3 install zstandard`); falls b
 
 ## Notes
 
+- **Cowork sessions** (`claude.ai/cowork/cse_*`, incl. every scheduled-task run) are cloud-only: no local file, and as of 2026-09-23 the desktop palette does not full-text index them. `-Scheduled` is the only way to reach them from this script, and only by date. Ad-hoc Cowork sessions that aren't task runs: use the web UI.
 - **Desktop:** only sidebar-visible conversations can be found; scroll the sidebar first if a chat isn't showing. Matches the first result — use `-List` to disambiguate.
 - **-Code:** multi-word `-Name` is an AND across the conversation, not an exact phrase. Use `-Project <substr>` to scope by working directory, `-IncludeAgents` to include the agent's own SDK sessions, and `-Limit` to widen the recency cap.
 - **macOS:** only conversations **opened in the desktop app on this Mac** are cached, so an unopened chat won't be found — open/scroll it once to cache it. The script is read-only and never mutates the cache. On this Mac it's also wired up as a `/find-claude-chat` Claude Code skill.
