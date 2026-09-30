@@ -572,7 +572,9 @@ function Get-CodexSessionInfo([string]$path, [string[]]$terms, [hashtable]$title
 # snippets. We drive that. Items: "<title> ChatGPT Ctrl+N" = ChatGPT chat,
 # "<title> <cwd-slug|project> Ctrl+N ... <snippet>" = Codex thread.
 
-$ChatGptAppId = 'OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!App'
+# 2026-09-29: manifest application id is '!ChatGPT', not '!App' (Get-AppxPackageManifest). OpenAI also
+# renamed the app "ChatGPT Classic"; the start-menu "ChatGPT" entry now points at the OpenAI.Codex package.
+$ChatGptAppId = 'OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!ChatGPT'
 
 function Get-ChatGptWindow([switch]$Launch) {
     for ($try = 0; $try -lt 2; $try++) {
@@ -580,7 +582,7 @@ function Get-ChatGptWindow([switch]$Launch) {
         if ($cgPids.Count) {
             $w = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
                 [System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition
-            ) | Where-Object { $_.Current.ProcessId -in $cgPids -and $_.Current.Name -eq 'ChatGPT' } | Select-Object -First 1
+            ) | Where-Object { $_.Current.ProcessId -in $cgPids -and $_.Current.Name -match '^ChatGPT' } | Select-Object -First 1
             if ($w) { return $w }
         }
         if (-not $Launch -or $try -eq 1) { return $null }
@@ -602,7 +604,35 @@ function Get-ChatGptCommandItems($window) {
     return @($items)
 }
 
+function Get-ChatGptModalInput($window) {
+    $window.FindFirst(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'global-search-modal-input'
+        )
+    )
+}
+
 function Search-ChatGptApp($window, [string]$query) {
+    # 2026-09-29: the "ChatGPT Classic" build replaced the Ctrl+K "Command menu" ComboBox with a search modal
+    # whose input is an Edit with AutomationId 'global-search-modal-input'. Three things about it:
+    #   - a UIA Invoke on the Search button does NOT open it; only a real mouse click does
+    #   - the modal KEEPS its previous text across Escape, so every query must clear the field first or the
+    #     search silently runs against the concatenation of every earlier query and returns "No results"
+    #   - results come back as a ListItem named "<title><snippet>" (no separator) paired with a Hyperlink named
+    #     "<title> <snippet>"; the title is recovered from the one space that differs between the two
+    # The old Command-menu path is kept as a fallback for older builds.
+    Add-Type -AssemblyName System.Windows.Forms
+    if (-not ('ChatGptMouse' -as [type])) {
+        Add-Type @"
+using System; using System.Runtime.InteropServices;
+public static class ChatGptMouse {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e);
+}
+"@
+    }
     # wait for the renderer to expose its tree (fresh launch takes a few seconds)
     $searchBtn = $null
     for ($n = 0; $n -lt 40 -and -not $searchBtn; $n++) {
@@ -615,36 +645,83 @@ function Search-ChatGptApp($window, [string]$query) {
         ) | Where-Object { $_.Current.Name -eq 'Search' } | Select-Object -First 1
         if (-not $searchBtn) { Start-Sleep -Milliseconds 500 }
     }
-    if (-not $searchBtn) { throw "ChatGPT app has no 'Search' button in its UIA tree (still loading, or signed out?)." }
-    Invoke-UiaElement $searchBtn
-    $combo = $null
-    for ($n = 0; $n -lt 20 -and -not $combo; $n++) {
+    if (-not $searchBtn) { throw "ChatGPT app has no 'Search' button in its UIA tree (still loading, signed out, or a promo modal is covering the UI - close it and retry)." }
+
+    [void][ChatGptMouse]::SetForegroundWindow([IntPtr]$window.Current.NativeWindowHandle); Start-Sleep -Milliseconds 300
+    $rect = $searchBtn.Current.BoundingRectangle
+    [void][ChatGptMouse]::SetCursorPos([int]($rect.X + $rect.Width / 2), [int]($rect.Y + $rect.Height / 2)); Start-Sleep -Milliseconds 120
+    [ChatGptMouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero); [ChatGptMouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+
+    $inp = $null; $combo = $null
+    for ($n = 0; $n -lt 30 -and -not $inp -and -not $combo; $n++) {
         Start-Sleep -Milliseconds 150
-        $combo = $window.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::ComboBox
-            )
-        ) | Where-Object { $_.Current.Name -eq 'Command menu' } | Select-Object -First 1
+        $inp = Get-ChatGptModalInput $window
+        if (-not $inp) {
+            $combo = $window.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::ComboBox
+                )
+            ) | Where-Object { $_.Current.Name -eq 'Command menu' } | Select-Object -First 1
+        }
     }
-    if (-not $combo) { throw "ChatGPT command menu did not open." }
-    # baseline = static entries (settings, New chat, ...) shown with an empty query; exclude them later
+
+    if ($combo) {
+        # legacy build: Ctrl+K command menu
+        $baseline = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($b in (Get-ChatGptCommandItems $window)) { [void]$baseline.Add([string]$b.Current.Name) }
+        $combo.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($query)
+        Start-Sleep -Milliseconds 3500
+        $out = @()
+        foreach ($it in (Get-ChatGptCommandItems $window)) {
+            $label = [string]$it.Current.Name
+            if ($baseline.Contains($label)) { continue }
+            $kind = 'codex'; $title = $label; $snippet = $null
+            if ($label -match '^(.*?) ChatGPT Ctrl\+\d+(?: \.\.\. (.*))?$') { $kind = 'chatgpt'; $title = $Matches[1]; $snippet = $Matches[2] }
+            elseif ($label -match '^(.*?) Ctrl\+\d+(?: \.\.\. (.*))?$') { $title = $Matches[1]; $snippet = $Matches[2] }
+            elseif ($label -match '^(.*?) \.\.\. (.*)$') { $title = $Matches[1]; $snippet = $Matches[2] }
+            $out += [PSCustomObject]@{ Kind = $kind; Title = $title; Snippet = $snippet; Label = $label; Element = $it }
+        }
+        return $out
+    }
+    if (-not $inp) { throw "ChatGPT search modal did not open (no 'global-search-modal-input' and no 'Command menu')." }
+
+    $inp.SetFocus(); Start-Sleep -Milliseconds 100
+    [System.Windows.Forms.SendKeys]::SendWait('^a{DEL}'); Start-Sleep -Milliseconds 250
+    $listCond = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)
+    $linkCond = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Hyperlink)
+    # baseline = sidebar chat list etc. present before typing; results are the ListItems that appear afterwards
     $baseline = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($b in (Get-ChatGptCommandItems $window)) { [void]$baseline.Add([string]$b.Current.Name) }
-    $combo.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($query)
+    foreach ($b in $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $listCond)) { [void]$baseline.Add([string]$b.Current.Name) }
+    $escaped = ''
+    foreach ($ch in $query.ToCharArray()) { if ('+^%~(){}[]'.Contains($ch)) { $escaped += '{' + $ch + '}' } else { $escaped += $ch } }
+    [System.Windows.Forms.SendKeys]::SendWait($escaped)
     Start-Sleep -Milliseconds 3500
+    $links = @($window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $linkCond) | Where-Object { $_.Current.Name })
     $out = @()
-    foreach ($it in (Get-ChatGptCommandItems $window)) {
+    foreach ($it in $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $listCond)) {
         $label = [string]$it.Current.Name
-        if ($baseline.Contains($label)) { continue }
-        $kind = 'codex'
-        $title = $label
-        $snippet = $null
-        if ($label -match '^(.*?) ChatGPT Ctrl\+\d+(?: \.\.\. (.*))?$') { $kind = 'chatgpt'; $title = $Matches[1]; $snippet = $Matches[2] }
-        elseif ($label -match '^(.*?) Ctrl\+\d+(?: \.\.\. (.*))?$') { $title = $Matches[1]; $snippet = $Matches[2] }
-        elseif ($label -match '^(.*?) \.\.\. (.*)$') { $title = $Matches[1]; $snippet = $Matches[2] }
-        $out += [PSCustomObject]@{ Kind = $kind; Title = $title; Snippet = $snippet; Label = $label; Element = $it }
+        if (-not $label -or $baseline.Contains($label)) { continue }
+        $title = $label; $snippet = $null; $el = $it
+        # the Hyperlink is the ListItem label with one space inserted at each join (title|snippet, or
+        # title|type|date for projects); walk both and take the first inserted space as the end of the title
+        # the two names can differ in their trailing text (different truncation), so only the prefix is validated:
+        # everything up to the first inserted space, plus 30 matching characters after it
+        foreach ($h in $links) {
+            $hn = [string]$h.Current.Name
+            if ($hn.Length -lt 8 -or $label.Length -lt 8 -or $hn.Substring(0, 8) -ne $label.Substring(0, 8)) { continue }
+            $i = 0; $j = 0; $t = $null; $ok = $true; $after = 0
+            while ($j -lt $hn.Length -and $i -lt $label.Length) {
+                if ($hn[$j] -eq $label[$i]) { $i++; $j++; if ($t) { $after++; if ($after -ge 30) { break } }; continue }
+                if ($hn[$j] -eq ' ') { if ($null -eq $t) { $t = $hn.Substring(0, $j) }; $j++; continue }
+                $ok = $false; break
+            }
+            if ($ok -and $t) { $title = $t; $snippet = $hn.Substring($t.Length + 1); $el = $h; break }
+        }
+        if ($title.Length -gt 200) { $title = $title.Substring(0, 200) + '...' }
+        if ($snippet -and $snippet.Length -gt 240) { $snippet = $snippet.Substring(0, 240) + '...' }
+        $out += [PSCustomObject]@{ Kind = 'chatgpt'; Title = $title; Snippet = $snippet; Label = $label; Element = $el }
     }
     return $out
 }
@@ -676,7 +753,12 @@ if ($ChatGPT) {
         Invoke-UiaElement $hits[0].Element
     } else {
         Add-Type -AssemblyName System.Windows.Forms
-        try { $combo = $cg.FindFirst([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Command menu')); if ($combo) { $combo.SetFocus(); [System.Windows.Forms.SendKeys]::SendWait('{ESC}') } } catch { }
+        # clear the modal's text before closing it - it is retained across Escape and would pollute the next search
+        try {
+            $inp = Get-ChatGptModalInput $cg
+            if ($inp) { $inp.SetFocus(); [System.Windows.Forms.SendKeys]::SendWait('^a{DEL}'); Start-Sleep -Milliseconds 150; [System.Windows.Forms.SendKeys]::SendWait('{ESC}') }
+            else { $combo = $cg.FindFirst([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Command menu')); if ($combo) { $combo.SetFocus(); [System.Windows.Forms.SendKeys]::SendWait('{ESC}') } }
+        } catch { }
     }
     exit $(if ($hits.Count) { 0 } else { 1 })
 }
